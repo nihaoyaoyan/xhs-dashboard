@@ -22,11 +22,12 @@ DASHBOARD_TITLE = "小红书笔记转化分析看板"
 DASHBOARD_SUBTITLE = "内容运营 · 店铺运营 · 投放运营 · 曝光·点击·成交全链路"
 TIMEZONE_LABEL = "Asia/Shanghai"
 DEFAULT_RANGE = "30D"
+UNLINKED_PRODUCT_ID = "__UNLINKED__"
 
 STORE_CONFIG = [
-    {"id": "store-1", "name": "鲜水湾", "path": ROOT / "data" / "stores" / "store-1" / "notes_gpm.csv"},
-    {"id": "store-2", "name": "琪琪生鲜", "path": ROOT / "data" / "stores" / "store-2" / "notes_gpm.csv"},
-    {"id": "store-3", "name": "玺牛生鲜", "path": ROOT / "data" / "stores" / "store-3" / "notes_gpm.csv"},
+    {"id": "store-1", "name": "鲜水湾", "path": ROOT / "data" / "stores" / "store-1" / "notes_gpm.csv", "product_path": ROOT / "data" / "stores" / "store-1" / "product_notes_archive"},
+    {"id": "store-2", "name": "琪琪生鲜", "path": ROOT / "data" / "stores" / "store-2" / "notes_gpm.csv", "product_path": ROOT / "data" / "stores" / "store-2" / "product_notes_archive"},
+    {"id": "store-3", "name": "玺牛生鲜", "path": ROOT / "data" / "stores" / "store-3" / "notes_gpm.csv", "product_path": ROOT / "data" / "stores" / "store-3" / "product_notes_archive"},
 ]
 
 
@@ -58,16 +59,19 @@ def read_sources(csv_path: Path | None = None) -> list[dict]:
     return rows
 
 
-def load_product_mapping() -> tuple[dict[str, dict], list[dict]]:
-    """Load note-to-product mapping from product-note Excel files.
+def load_product_mapping(store_dir: Path | None = None) -> tuple[dict[str, dict], list[dict]]:
+    """Load one store's note-to-product mapping from its Excel file.
     
     Returns:
         (note_map, product_list)
         - note_map: {笔记ID: {"商品ID": ..., "商品名称": ...}}
         - product_list: [{"id": ..., "name": ..., "short_name": ..., "count": ..., "category": ...}]
     """
-    upload_dir = Path("/workspace/.uploads")
-    excel_files = sorted(upload_dir.glob("*商品笔记数据*.xlsx"))
+    if store_dir is None:
+        upload_dir = Path("/workspace/.uploads")
+        excel_files = sorted(upload_dir.glob("*商品笔记数据*.xlsx"))
+    else:
+        excel_files = sorted(store_dir.glob("????-??.xlsx"), reverse=True)
     
     note_map: dict[str, dict] = {}
     product_counts: dict[str, int] = {}
@@ -77,13 +81,18 @@ def load_product_mapping() -> tuple[dict[str, dict], list[dict]]:
         try:
             import pandas as pd
             df = pd.read_excel(f)
-            df["关联商品ID"] = df["关联商品ID"].astype(str)
-            df["笔记ID"] = df["笔记ID"].astype(str)
-            
+            required = {"笔记ID", "关联商品ID", "关联商品名称"}
+            if not required.issubset(df.columns):
+                continue
+
             for _, row in df.iterrows():
-                pid = str(row["关联商品ID"])
-                nid = str(row["笔记ID"])
-                pname = str(row["关联商品名称"])
+                if pd.isna(row["笔记ID"]) or pd.isna(row["关联商品ID"]):
+                    continue
+                nid = str(row["笔记ID"]).strip()
+                pid = str(row["关联商品ID"]).strip()
+                pname = "" if pd.isna(row["关联商品名称"]) else str(row["关联商品名称"]).strip()
+                if not nid or not pid or pid.lower() == "nan":
+                    continue
                 
                 if pid not in product_names:
                     product_names[pid] = pname
@@ -163,9 +172,10 @@ def load_product_mapping() -> tuple[dict[str, dict], list[dict]]:
     return note_map, product_list
 
 
-def normalize_snapshots(rows: list[dict]) -> list[dict]:
+def normalize_snapshots(rows: list[dict], store_dir: Path | None = None, note_product_map: dict[str, dict] | None = None) -> list[dict]:
     """Normalize and deduplicate rows by 笔记ID."""
-    note_product_map, product_list = load_product_mapping()
+    if note_product_map is None:
+        note_product_map, _ = load_product_mapping(store_dir)
     normalized = []
     for raw in rows:
         row = dict(raw)
@@ -187,7 +197,7 @@ def normalize_snapshots(rows: list[dict]) -> list[dict]:
         
         # 商品信息
         prod_info = note_product_map.get(note_id, {})
-        row["商品ID"] = prod_info.get("商品ID", "")
+        row["商品ID"] = prod_info.get("商品ID", UNLINKED_PRODUCT_ID)
         row["商品名称"] = prod_info.get("商品名称", "未关联商品")
         
         normalized.append(row)
@@ -210,10 +220,20 @@ def sum_between(rows: list[dict], start: str, end: str, field: str) -> float:
     return sum(float(row.get(field) or 0) for row in rows if start <= row["date"] <= end)
 
 
-def make_dashboard_payload(rows: list[dict], store_id: str = "store-1", store_name: str = "店铺一") -> dict:
-    _, product_list = load_product_mapping()
+def make_dashboard_payload(rows: list[dict], store_id: str = "store-1", store_name: str = "店铺一", product_list: list[dict] | None = None) -> dict:
+    if product_list is None:
+        _, product_list = load_product_mapping()
     row_product_ids = {str(r.get("商品ID") or "") for r in rows}
     product_list = [p for p in product_list if str(p.get("id") or "") in row_product_ids]
+    unlinked_count = sum(1 for r in rows if r.get("商品ID") == UNLINKED_PRODUCT_ID)
+    if unlinked_count:
+        product_list.append({
+            "id": UNLINKED_PRODUCT_ID,
+            "name": "未关联商品",
+            "short_name": "未关联商品",
+            "count": unlinked_count,
+            "category": "未关联",
+        })
     dates = sorted({row["date"] for row in rows if row["date"] and row["date"] != "NaT"})
     latest = dates[-1] if dates else ""
     start_30 = dates[-30] if len(dates) >= 30 else (dates[0] if dates else "")
@@ -1313,6 +1333,7 @@ def render_dashboard_blocks(blocks: list[dict]) -> str:
 
 ANALYSIS_LOGIC = """Analysis logic
 - read_sources() loads the CSV file from data/notes_gpm.csv.
+- load_product_mapping() merges the current store's monthly files from data/stores/<store>/product_notes_archive/.
 - normalize_snapshots() standardizes numeric fields and deduplicates by 笔记ID.
 - make_dashboard_payload() computes KPIs, GPM leaderboard, exposure leaderboard,
   account summary, daily trend, promo comparison, and type comparison.
@@ -3359,8 +3380,9 @@ def main() -> None:
         source_path = store["path"]
         if store["id"] == "store-1" and not source_path.exists() and legacy_source.exists():
             source_path = legacy_source
-        rows = normalize_snapshots(read_sources(source_path))
-        store_payloads[store["id"]] = make_dashboard_payload(rows, store["id"], store["name"])
+        note_product_map, product_list = load_product_mapping(store["product_path"])
+        rows = normalize_snapshots(read_sources(source_path), store["product_path"], note_product_map)
+        store_payloads[store["id"]] = make_dashboard_payload(rows, store["id"], store["name"], product_list)
 
     primary_payload = store_payloads[STORE_CONFIG[0]["id"]]
     if not any(payload["datasets"]["allRows"] for payload in store_payloads.values()):
