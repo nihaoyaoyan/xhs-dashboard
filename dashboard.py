@@ -19,9 +19,15 @@ DASHBOARD_HTML = ROOT / "index.html"
 DASHBOARD_DATA = ROOT / "dashboard_data.json"
 
 DASHBOARD_TITLE = "小红书笔记转化分析看板"
-DASHBOARD_SUBTITLE = "曝光·点击·成交全链路 · 素材效率分析"
+DASHBOARD_SUBTITLE = "内容运营 · 店铺运营 · 投放运营 · 曝光·点击·成交全链路"
 TIMEZONE_LABEL = "Asia/Shanghai"
 DEFAULT_RANGE = "30D"
+
+STORE_CONFIG = [
+    {"id": "store-1", "name": "鲜水湾", "path": ROOT / "data" / "stores" / "store-1" / "notes_gpm.csv"},
+    {"id": "store-2", "name": "琪琪生鲜", "path": ROOT / "data" / "stores" / "store-2" / "notes_gpm.csv"},
+    {"id": "store-3", "name": "玺牛生鲜", "path": ROOT / "data" / "stores" / "store-3" / "notes_gpm.csv"},
+]
 
 
 def fmt_num(value: float) -> str:
@@ -36,9 +42,9 @@ def pct(value: float) -> str:
     return f"{value * 100:+.1f}%"
 
 
-def read_sources() -> list[dict]:
-    """Read the GPM CSV data."""
-    csv_path = ROOT / "data" / "notes_gpm.csv"
+def read_sources(csv_path: Path | None = None) -> list[dict]:
+    """Read one store's GPM CSV data."""
+    csv_path = csv_path or ROOT / "data" / "notes_gpm.csv"
     if not csv_path.exists():
         return []
     rows = []
@@ -204,8 +210,10 @@ def sum_between(rows: list[dict], start: str, end: str, field: str) -> float:
     return sum(float(row.get(field) or 0) for row in rows if start <= row["date"] <= end)
 
 
-def make_dashboard_payload(rows: list[dict]) -> dict:
+def make_dashboard_payload(rows: list[dict], store_id: str = "store-1", store_name: str = "店铺一") -> dict:
     _, product_list = load_product_mapping()
+    row_product_ids = {str(r.get("商品ID") or "") for r in rows}
+    product_list = [p for p in product_list if str(p.get("id") or "") in row_product_ids]
     dates = sorted({row["date"] for row in rows if row["date"] and row["date"] != "NaT"})
     latest = dates[-1] if dates else ""
     start_30 = dates[-30] if len(dates) >= 30 else (dates[0] if dates else "")
@@ -360,13 +368,43 @@ def make_dashboard_payload(rows: list[dict]) -> dict:
     avg_gpm_7 = (total_payment_7 / total_exposure_7 * 1000) if total_exposure_7 > 0 else 0
     gpm_delta = (avg_gpm_30 - avg_gpm_7) / avg_gpm_7 if avg_gpm_7 > 0 else 0
 
-    # GPM leaderboard (full sorted list; runtime applies filter + limit)
-    paid_sorted = sorted(paid_rows, key=lambda r: r["GPM"], reverse=True)
-    gpm_leaderboard = [
-        {
+    # 内容行动建议：先区分可比较样本，再给出下一步动作。
+    # 低于门槛的笔记仍保留在明细中，但不参与“可比较GPM”排行。
+    min_gpm_exposure = 5000
+    min_gpm_orders = 3
+
+    def content_action(r: dict) -> tuple[str, int]:
+        exposure = r["曝光量"]
+        clicks = r["商品点击次数"]
+        orders = r["支付订单数"]
+        if exposure <= 0:
+            return "数据不足", 99
+        if r["支付金额"] > 0:
+            if exposure < min_gpm_exposure or orders < min_gpm_orders:
+                return "观察（小样本）", 4
+            if r.get("问题诊断") == "优质素材":
+                return "待复制", 1
+            if r.get("问题诊断") == "缺流量":
+                return "优化标题/封面", 2
+            if r.get("问题诊断") == "内容需优化":
+                return "优化内容承接", 2
+            return "继续优化", 3
+        if exposure >= min_gpm_exposure and clicks > 0:
+            return "优化商品承接", 2
+        if exposure >= min_gpm_exposure:
+            return "优化标题/封面", 2
+        return "继续观察", 5
+
+    def content_row(r: dict) -> dict:
+        action, priority = content_action(r)
+        comparable = r["曝光量"] >= min_gpm_exposure and r["支付订单数"] >= min_gpm_orders
+        return {
+            "日期": r["date"],
+            "date": r["date"],
             "笔记ID": r["笔记ID"],
             "笔记标题": r.get("笔记标题", "")[:30],
             "账号": r.get("账号", ""),
+            "笔记类型": r.get("笔记类型", "未知"),
             "商品ID": r["商品ID"],
             "商品名称": r["商品名称"],
             "GPM": round(r["GPM"], 2),
@@ -377,11 +415,28 @@ def make_dashboard_payload(rows: list[dict]) -> dict:
             "互动量": r["互动量"],
             "商品点击次数": r["商品点击次数"],
             "曝光阶段": r.get("曝光阶段", ""),
+            "样本状态": "可比较" if comparable else "小样本",
+            "可比较排序": 1 if comparable else 0,
             "潜力标签": r.get("潜力标签", ""),
             "问题诊断": r.get("问题诊断", ""),
+            "行动建议": action,
+            "行动优先级": priority,
         }
+
+    content_rows = [content_row(r) for r in rows]
+    paid_sorted = sorted(
+        [r for r in content_rows if r["支付金额"] > 0],
+        key=lambda r: (r["可比较排序"], r["GPM"]),
+        reverse=True,
+    )
+    gpm_leaderboard = [
+        r
         for r in paid_sorted
     ]
+    content_action_queue = sorted(
+        content_rows,
+        key=lambda r: (r["行动优先级"], -r["支付金额"], -r["曝光量"]),
+    )
 
     # Exposure leaderboard (full sorted list; runtime applies filter + limit)
     exposure_sorted = sorted(rows, key=lambda r: r["曝光量"], reverse=True)
@@ -398,6 +453,7 @@ def make_dashboard_payload(rows: list[dict]) -> dict:
             "支付金额": r["支付金额"],
             "GPM": round(r["GPM"], 2),
             "GPM状态": r["GPM状态"],
+            "date": r["date"],
             "曝光阶段": r.get("曝光阶段", ""),
         }
         for r in exposure_sorted
@@ -514,6 +570,10 @@ scatter = [{'曝光量': r['曝光量'], 'GPM': r['GPM'],
         "accountComparison": """# 账号对比
 group by 账号, sum 支付金额, 曝光量, 笔记数
 avg_gpm = 总支付金额 / 总曝光量 * 1000""",
+        "contentTypeComparison": """# 内容类型对比
+group by 笔记类型
+比较笔记数、总曝光、总支付金额和平均GPM
+仅用于识别图文/视频的历史表现差异，不代表因果结论""",
         "dailyTrend": """# 每日支付趋势
 daily = group by date, sum 支付金额, 支付订单, 曝光量
 daily_gpm = 支付金额 / 曝光量 * 1000""",
@@ -540,7 +600,7 @@ Q4 需改进: 高曝光 · 低GPM（优化转化）
 📉 长尾层 50名以后：批量处理
 验证帕累托法则：20%笔记贡献80%成交""",
         "zeroPayAnalysis": """# 零成交笔记诊断
-对零成交笔记按CTR和商品点击率分四象限：
+仅对支付金额为0且商品点击次数大于0的笔记按CTR和商品点击率分四象限：
 🟡 有潜力：高CTR+高商品点击→优化商品承接
 🟢 缺流量：低CTR+高商品点击→优化标题封面/投流
 🔴 无效流量：高CTR+低商品点击→标题党/内容不匹配
@@ -580,6 +640,8 @@ Y轴 = 平均GPM（效率）
     }
 
     return {
+        "storeId": store_id,
+        "storeName": store_name,
         "title": DASHBOARD_TITLE,
         "subtitle": DASHBOARD_SUBTITLE,
         "timezone": TIMEZONE_LABEL,
@@ -597,7 +659,7 @@ Y轴 = 平均GPM（效率）
                 "label": "笔记总数",
                 "value": f"{len(rows)}",
                 "delta": f"有{len(paid_rows)}条产生成交",
-                "detail": f"成交率 {len(paid_rows)/len(rows)*100:.1f}%",
+                "detail": f"成交率 {len(paid_rows)/len(rows)*100:.1f}%" if rows else "成交率 0.0%",
             },
             {
                 "id": "totalPayment",
@@ -617,6 +679,7 @@ Y轴 = 平均GPM（效率）
         "stageStats": stage_stats,
         "datasets": {
             "gpmLeaderboard": gpm_leaderboard,
+            "contentActionQueue": content_action_queue,
             "exposureLeaderboard": exposure_leaderboard,
             "paidRows": paid_rows,
             "allRows": rows,
@@ -633,6 +696,15 @@ Y轴 = 平均GPM（效率）
             "combine": {},
             "productNames": {p["id"]: p["short_name"] for p in product_list},
             "productList": product_list,
+        },
+        "accountFilter": {
+            "options": ["全部"] + [a["账号"] for a in account_summary],
+            "default": "全部",
+        },
+        "noteTypeFilter": {
+            "field": "笔记类型",
+            "options": ["全部"] + sorted({str(r.get("笔记类型") or "未知") for r in rows}),
+            "default": "全部",
         },
         "sourceSnippets": source_snippets,
     }
@@ -713,7 +785,7 @@ def panel_span_attr(block: dict) -> str:
 
 def render_chart_block(block: dict) -> str:
     return f"""
-    <section class="dashboard-panel chart-panel" {panel_span_attr(block)} id="{html.escape(block["id"])}">
+    <section class="dashboard-panel chart-panel" data-section="{html.escape(block.get("section", "content"))}" {panel_span_attr(block)} id="{html.escape(block["id"])}">
       <header>
         <div>
           <h2>{html.escape(block["title"])}</h2>
@@ -731,7 +803,7 @@ def render_table_block(block: dict) -> str:
     columns = block["columns"]
     head = "".join(f"<th>{html.escape(col['label'])}</th>" for col in columns)
     return f"""
-    <section class="dashboard-panel table-panel" {panel_span_attr(block)} id="{html.escape(block["id"])}">
+    <section class="dashboard-panel table-panel" data-section="{html.escape(block.get("section", "content"))}" {panel_span_attr(block)} id="{html.escape(block["id"])}">
       <header>
         <div>
           <h2>{html.escape(block["title"])}</h2>
@@ -757,7 +829,7 @@ def render_table_block(block: dict) -> str:
 
 def render_note_block(block: dict) -> str:
     return f"""
-    <section class="dashboard-note" {panel_span_attr(block)} id="{html.escape(block["id"])}">
+    <section class="dashboard-note" data-section="{html.escape(block.get("section", "shared"))}" {panel_span_attr(block)} id="{html.escape(block["id"])}">
       <strong>{html.escape(block["title"])}</strong>
       <span>{html.escape(block["body"])}</span>
     </section>
@@ -812,8 +884,8 @@ def build_dashboard_blocks(payload: dict) -> list[dict]:
             "id": "panel-gpm-leaderboard",
             "chart_id": "gpmLeaderboard",
             "source_key": "gpmLeaderboard",
-            "title": "GPM 排行榜 TOP30",
-            "subtitle": "有成交笔记按GPM降序排列",
+            "title": "可比较GPM排行榜 TOP30",
+            "subtitle": "曝光≥5,000且支付订单≥3的笔记；小样本不参与排行",
             "unit": "GPM",
             "source_context": "来源：商品笔记支付数据（两段累加）",
             "allowed_types": ["bar", "scatter"],
@@ -875,6 +947,19 @@ def build_dashboard_blocks(payload: dict) -> list[dict]:
         },
         {
             "kind": "chart",
+            "id": "panel-content-type-comparison",
+            "chart_id": "contentTypeComparison",
+            "source_key": "contentTypeComparison",
+            "title": "内容类型表现",
+            "subtitle": "图文与视频的历史曝光、成交和GPM对比",
+            "unit": "金额（元）/ GPM",
+            "source_context": "来源：按笔记类型汇总 · 仅作历史表现比较",
+            "allowed_types": ["bar"],
+            "initial_type": "bar",
+            "dense": False,
+        },
+        {
+            "kind": "chart",
             "id": "panel-product-comparison",
             "chart_id": "productComparison",
             "source_key": "productComparison",
@@ -918,9 +1003,9 @@ def build_dashboard_blocks(payload: dict) -> list[dict]:
             "chart_id": "zeroPayAnalysis",
             "source_key": "zeroPayAnalysis",
             "title": "零成交笔记诊断",
-            "subtitle": "CTR × 商品点击率四象限 · 识别无效流量",
+            "subtitle": "仅统计有商品点击但未成交的笔记 · CTR × 商品点击率四象限",
             "unit": "CTR / 商品点击率",
-            "source_context": "来源：零成交笔记 · 按中位数分割四象限",
+            "source_context": "来源：支付金额=0且商品点击次数>0 · 按中位数分割四象限",
             "allowed_types": ["scatter"],
             "initial_type": "scatter",
         },
@@ -941,8 +1026,8 @@ def build_dashboard_blocks(payload: dict) -> list[dict]:
             "id": "panel-promo-comparison",
             "chart_id": "promoComparison",
             "source_key": "promoComparison",
-            "title": "推广状态对比",
-            "subtitle": "已推广 vs 未推广的成交表现",
+            "title": "推广状态观察",
+            "subtitle": "已推广 vs 未推广 · 仅作状态观察，不代表投放增量效果",
             "unit": "金额（元）",
             "source_context": "来源：推广状态分组汇总",
             "allowed_types": ["bar", "pie"],
@@ -953,19 +1038,64 @@ def build_dashboard_blocks(payload: dict) -> list[dict]:
             "id": "panel-gpm-table",
             "table_id": "gpmTable",
             "source_key": "gpmLeaderboard",
-            "title": "GPM 排行榜（明细）",
-            "subtitle": "有成交笔记TOP30 · 含曝光阶段、潜力标签、问题诊断",
+            "title": "GPM 明细（含样本状态）",
+            "subtitle": "可比较样本优先；小样本保留查看但不代表稳定效率",
             "source_context": "来源：商品笔记支付数据（两段累加）",
             "columns": [
                 {"field": "笔记ID", "label": "笔记ID", "long_text": True},
                 {"field": "笔记标题", "label": "笔记标题", "long_text": True},
+                {"field": "素材年龄", "label": "素材年龄"},
                 {"field": "账号", "label": "账号"},
                 {"field": "曝光阶段", "label": "曝光阶段"},
+                {"field": "样本状态", "label": "样本状态"},
                 {"field": "潜力标签", "label": "潜力标签"},
                 {"field": "问题诊断", "label": "问题诊断"},
+                {"field": "行动建议", "label": "行动建议"},
                 {"field": "GPM", "label": "GPM", "numeric": True},
                 {"field": "支付金额", "label": "支付金额", "numeric": True},
                 {"field": "曝光量", "label": "曝光量", "numeric": True},
+            ],
+        },
+        {
+            "kind": "table",
+            "id": "panel-content-action",
+            "table_id": "contentActionTable",
+            "source_key": "contentActionQueue",
+            "title": "内容行动队列",
+            "subtitle": "按优先级给出待复制、优化、观察动作；小样本不进入可比较GPM排行",
+            "source_context": "来源：笔记曝光、点击、支付数据 · 行动建议为规则判断",
+            "columns": [
+                {"field": "行动建议", "label": "行动建议"},
+                {"field": "样本状态", "label": "样本状态"},
+                {"field": "问题诊断", "label": "问题诊断"},
+                {"field": "笔记标题", "label": "笔记标题", "long_text": True},
+                {"field": "素材年龄", "label": "素材年龄"},
+                {"field": "账号", "label": "账号"},
+                {"field": "曝光量", "label": "曝光量", "numeric": True},
+                {"field": "商品点击次数", "label": "商品点击", "numeric": True},
+                {"field": "支付订单数", "label": "订单数", "numeric": True},
+                {"field": "GPM", "label": "GPM", "numeric": True},
+            ],
+        },
+        {
+            "kind": "table",
+            "id": "panel-official-support",
+            "table_id": "officialSupportTable",
+            "source_key": "allRows",
+            "title": "官方流量扶持候选",
+            "subtitle": "近15日发布且阅读量大于200 · 仅作运营筛选，不代表平台已实际扶持",
+            "source_context": "来源：当前店铺笔记数据 · 发布时间按浏览器当前日期计算",
+            "columns": [
+                {"field": "笔记标题", "label": "笔记标题", "long_text": True},
+                {"field": "素材发布时间", "label": "素材发布时间"},
+                {"field": "素材年龄", "label": "素材年龄"},
+                {"field": "账号", "label": "账号"},
+                {"field": "笔记类型", "label": "笔记类型"},
+                {"field": "阅读量", "label": "阅读量", "numeric": True},
+                {"field": "曝光量", "label": "曝光量", "numeric": True},
+                {"field": "商品点击次数", "label": "商品点击次数", "numeric": True},
+                {"field": "支付金额", "label": "支付金额", "numeric": True},
+                {"field": "GPM", "label": "GPM", "numeric": True},
             ],
         },
         {
@@ -979,6 +1109,7 @@ def build_dashboard_blocks(payload: dict) -> list[dict]:
             "columns": [
                 {"field": "笔记ID", "label": "笔记ID", "long_text": True},
                 {"field": "笔记标题", "label": "笔记标题", "long_text": True},
+                {"field": "素材年龄", "label": "素材年龄"},
                 {"field": "账号", "label": "账号"},
                 {"field": "曝光量", "label": "曝光量", "numeric": True},
                 {"field": "阅读量", "label": "阅读量", "numeric": True},
@@ -999,6 +1130,7 @@ def build_dashboard_blocks(payload: dict) -> list[dict]:
                 {"field": "象限", "label": "象限"},
                 {"field": "笔记ID", "label": "笔记ID", "long_text": True},
                 {"field": "笔记标题", "label": "笔记标题", "long_text": True},
+                {"field": "素材年龄", "label": "素材年龄"},
                 {"field": "账号", "label": "账号"},
                 {"field": "曝光量", "label": "曝光量", "numeric": True},
                 {"field": "GPM", "label": "GPM", "numeric": True},
@@ -1029,8 +1161,8 @@ def build_dashboard_blocks(payload: dict) -> list[dict]:
             "id": "panel-lifecycle-analysis",
             "chart_id": "lifecycleAnalysis",
             "source_key": "lifecycleAnalysis",
-            "title": "笔记生命周期分析",
-            "subtitle": "按发布天数分组 · 观察各阶段效率变化",
+            "title": "笔记生命周期分析（探索性）",
+            "subtitle": "按距最新数据日期分组 · 非24小时/72小时/7天同龄窗口",
             "unit": "GPM / 转化率",
             "source_context": "来源：按发布时间距今天数分组 · 5个年龄段",
             "allowed_types": ["bar", "pie"],
@@ -1084,22 +1216,98 @@ def build_dashboard_blocks(payload: dict) -> list[dict]:
             "compact": False,
         },
     ])
+
+    # 三层分级与GPM排行重复，内容首页移除，避免同一结论重复展示。
+    blocks = [block for block in blocks if block["id"] != "panel-three-tier"]
+    blocks.append({
+        "kind": "note",
+        "id": "content-data-readiness",
+        "title": "内容运营数据状态",
+        "body": "当前已支持笔记效率、内容类型、账号、商品点击和支付的历史分析。当前数据不含自然/付费拆分、评论收藏转发明细、24小时/72小时/7天同龄快照、标题母体和实验ID，因此相关结论只能作为历史表现观察，不能直接证明因果或稳定复现。",
+        "compact": False,
+    })
+    blocks.append({
+        "kind": "note",
+        "id": "promotion-data-readiness",
+        "title": "投放运营数据状态",
+        "body": "当前数据只有笔记层面的推广状态，没有千帆计划ID、创意ID、消耗、付费曝光、付费点击、ROI或自然/付费拆分。因此本板块目前只能做推广状态观察，不能据此判断预算放量、暂停或投放增量效果。接入计划与创意明细后再升级为正式投放诊断。",
+        "compact": False,
+    })
+    for block in blocks:
+        if block["id"] == "data-note":
+            block["body"] = block["body"].replace(
+                "【三层分级说明】\n🔥 爆款层(TOP10)：贡献约35%成交，重点维护加投\n⭐ 潜力层(11-50名)：贡献约30%成交，观察优化\n📉 长尾层(50名以后)：贡献约35%成交，批量处理\n\n",
+                "",
+            )
+
+    # 按业务决策边界归类现有图表，底层指标口径保持不变。
+    section_map = {
+        "panel-gpm-leaderboard": "content",
+        "panel-gpm-vs-exposure": "content",
+        "panel-quadrant-matrix": "content",
+        "panel-ctr-cvr-matrix": "content",
+        "panel-account-comparison": "content",
+        "panel-content-type-comparison": "content",
+        "panel-three-tier": "content",
+        "panel-zero-analysis": "content",
+        "panel-gpm-table": "content",
+        "panel-content-action": "content",
+        "panel-official-support": "content",
+        "panel-exposure-table": "content",
+        "panel-quadrant-rank-table": "content",
+        "panel-lifecycle-analysis": "content",
+        "panel-product-comparison": "store",
+        "panel-funnel": "store",
+        "panel-product-table": "store",
+        "panel-account-product-heatmap": "store",
+        "panel-efficiency-scale": "store",
+        "panel-daily-trend": "promotion",
+        "panel-promo-comparison": "promotion",
+        "panel-benchmark-comparison": "promotion",
+        "promotion-data-readiness": "promotion",
+        "content-data-readiness": "content",
+        "data-note": "shared",
+    }
+    for block in blocks:
+        block["section"] = section_map.get(block["id"], "content")
     return blocks
 
 
 def render_dashboard_blocks(blocks: list[dict]) -> str:
     kpis = "\n".join(render_kpi_block(block) for block in blocks if block["kind"] == "kpi")
-    panels = []
-    for block in blocks:
-        if block["kind"] == "chart":
-            panels.append(render_chart_block(block))
-        elif block["kind"] == "table":
-            panels.append(render_table_block(block))
-        elif block["kind"] == "note":
-            panels.append(render_note_block(block))
+    section_meta = {
+        "content": ("内容运营", "判断哪些笔记值得复制、优化或停止"),
+        "store": ("店铺运营", "定位商品承接、转化和经营效率问题"),
+        "promotion": ("投放运营", "判断投放数据是否足够支持预算分配"),
+        "shared": ("数据说明", "跨板块共用的数据范围、来源和限制"),
+    }
+    section_panels = []
+    for section in ["content", "store", "promotion", "shared"]:
+        section_blocks = [b for b in blocks if b.get("section") == section and b["kind"] != "kpi"]
+        if not section_blocks:
+            continue
+        title, subtitle = section_meta[section]
+        rendered = []
+        for block in section_blocks:
+            if block["kind"] == "chart":
+                rendered.append(render_chart_block(block))
+            elif block["kind"] == "table":
+                rendered.append(render_table_block(block))
+            elif block["kind"] == "note":
+                rendered.append(render_note_block(block))
+        section_panels.append(f'''<section class="dashboard-section" data-section-panel="{section}">
+          <div class="section-heading"><div><h2>{title}</h2><p>{subtitle}</p></div></div>
+          <div class="panel-grid">{"".join(rendered)}</div>
+        </section>''')
     return f"""
     <section class="kpi-grid">{kpis}</section>
-    <section class="panel-grid">{"".join(panels)}</section>
+    <nav class="section-tabs" aria-label="运营板块">
+      <button class="section-tab is-active" data-section-tab="content">内容运营</button>
+      <button class="section-tab" data-section-tab="store">店铺运营</button>
+      <button class="section-tab" data-section-tab="promotion">投放运营</button>
+      <button class="section-tab" data-section-tab="shared">数据说明</button>
+    </nav>
+    {"".join(section_panels)}
     """
 
 
@@ -1112,7 +1320,7 @@ ANALYSIS_LOGIC = """Analysis logic
 - dashboard_runtime.js applies client-side date filtering against the analytical date field."""
 
 
-def build_html(payload: dict) -> str:
+def build_html(payload: dict, store_payloads: dict[str, dict] | None = None) -> str:
     echarts = ECHARTS_JS.read_text(encoding="utf-8")
     runtime = DASHBOARD_RUNTIME_JS.read_text(encoding="utf-8")
     blocks = build_dashboard_blocks(payload)
@@ -1125,12 +1333,14 @@ def build_html(payload: dict) -> str:
     table_config = {
         "gpmTable": {
             "dataset": "gpmLeaderboard",
+            "contentAge": True,
             "sortField": "GPM",
             "sortDirection": "desc",
             "limit": 30,
             "columns": [
                 {"field": "笔记ID"},
                 {"field": "笔记标题"},
+                {"field": "素材年龄"},
                 {"field": "账号"},
                 {"field": "曝光阶段"},
                 {"field": "潜力标签"},
@@ -1140,14 +1350,56 @@ def build_html(payload: dict) -> str:
                 {"field": "曝光量", "numeric": True},
             ],
         },
+        "contentActionTable": {
+            "dataset": "contentActionQueue",
+            "contentAge": True,
+            "sortField": "行动优先级",
+            "sortDirection": "asc",
+            "limit": 30,
+            "columns": [
+                {"field": "行动建议"},
+                {"field": "样本状态"},
+                {"field": "问题诊断"},
+                {"field": "笔记标题"},
+                {"field": "素材年龄"},
+                {"field": "账号"},
+                {"field": "曝光量", "numeric": True},
+                {"field": "商品点击次数", "numeric": True},
+                {"field": "支付订单数", "numeric": True},
+                {"field": "GPM", "numeric": True},
+            ],
+        },
+        "officialSupportTable": {
+            "derived": "officialSupportCandidates",
+            "contentAge": True,
+            "sortFields": [
+                {"field": "date", "direction": "desc"},
+                {"field": "阅读量", "direction": "desc"},
+            ],
+            "limit": 30,
+            "columns": [
+                {"field": "笔记标题"},
+                {"field": "素材发布时间"},
+                {"field": "素材年龄"},
+                {"field": "账号"},
+                {"field": "笔记类型"},
+                {"field": "阅读量", "numeric": True},
+                {"field": "曝光量", "numeric": True},
+                {"field": "商品点击次数", "numeric": True},
+                {"field": "支付金额", "numeric": True},
+                {"field": "GPM", "numeric": True},
+            ],
+        },
         "exposureTable": {
             "dataset": "exposureLeaderboard",
+            "contentAge": True,
             "sortField": "曝光量",
             "sortDirection": "desc",
             "limit": 30,
             "columns": [
                 {"field": "笔记ID"},
                 {"field": "笔记标题"},
+                {"field": "素材年龄"},
                 {"field": "账号"},
                 {"field": "曝光阶段"},
                 {"field": "曝光量", "numeric": True},
@@ -1159,6 +1411,7 @@ def build_html(payload: dict) -> str:
         },
         "quadrantRankTable": {
             "dataset": "paidRows",
+            "contentAge": True,
             "sortField": "支付金额",
             "sortDirection": "desc",
             "limit": 50,
@@ -1168,6 +1421,7 @@ def build_html(payload: dict) -> str:
                 {"field": "问题诊断"},
                 {"field": "笔记ID"},
                 {"field": "笔记标题"},
+                {"field": "素材年龄"},
                 {"field": "账号"},
                 {"field": "曝光量", "numeric": True},
                 {"field": "GPM", "numeric": True},
@@ -1211,6 +1465,15 @@ def build_html(payload: dict) -> str:
                 label = f'{p["short_name"]} ({p["count"]}条)'
                 product_options_html += f'<option value="{html.escape(p["id"])}">{html.escape(label)}</option>'
             product_options_html += '</optgroup>'
+
+    account_options_html = '<option value="全部">全部账号</option>'
+    for account in payload.get("accountFilter", {}).get("options", [])[1:]:
+        account_options_html += f'<option value="{html.escape(account)}">{html.escape(account)}</option>'
+
+    note_type_options_html = "".join(
+        f'<option value="{html.escape(note_type)}">{html.escape(note_type if note_type != "全部" else "全部类型")}</option>'
+        for note_type in payload.get("noteTypeFilter", {}).get("options", ["全部"])
+    )
 
     # Build account color keys for chart JS
     account_color_map = {}
@@ -1307,7 +1570,7 @@ def build_html(payload: dict) -> str:
     html { background: var(--page); }
     body {
       margin: 0;
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Helvetica Neue", Arial, sans-serif;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", "PingFang SC", "Noto Sans CJK SC", "Helvetica Neue", Arial, sans-serif;
       background: var(--page);
       color: var(--ink);
       font-size: 1rem;
@@ -1468,6 +1731,38 @@ def build_html(payload: dict) -> str:
     .kpi-tile:first-child strong,
     .kpi-tile:first-child span,
     .kpi-tile:first-child small { color: var(--brand-text); }
+    .section-tabs {
+      display: flex;
+      gap: 8px;
+      margin: 4px 0 18px;
+      padding: 4px;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: var(--surface);
+    }
+    .section-tab {
+      flex: 1;
+      min-height: 40px;
+      border: 0;
+      border-radius: 8px;
+      background: transparent;
+      color: var(--muted);
+      font: inherit;
+      font-size: 14px;
+      cursor: pointer;
+    }
+    .section-tab:hover { color: var(--ink); background: var(--soft); }
+    .section-tab.is-active { background: var(--brand); color: var(--brand-text); font-weight: 600; }
+    .dashboard-section { display: none; }
+    .dashboard-section.is-active { display: block; }
+    .section-heading {
+      display: flex;
+      align-items: end;
+      justify-content: space-between;
+      margin: 0 0 12px;
+    }
+    .section-heading h2 { margin: 0; font-size: 20px; font-weight: 600; }
+    .section-heading p { margin: 3px 0 0; color: var(--muted); font-size: 13px; }
     .panel-grid {
       display: grid;
       grid-template-columns: repeat(12, minmax(0, 1fr));
@@ -1737,8 +2032,15 @@ def build_html(payload: dict) -> str:
     }
     """
 
+    store_payloads = store_payloads or {payload.get("storeId", "store-1"): payload}
+    store_payloads_json = json_script(store_payloads)
+    store_options_html = "".join(
+        f'<option value="{html.escape(store_id)}">{html.escape(store.get("storeName", store_id))}</option>'
+        for store_id, store in store_payloads.items()
+    )
     chart_js = f"""
-    const dashboardPayload = {json_script(payload)};
+    const storePayloads = {store_payloads_json};
+    const dashboardPayload = storePayloads[{json.dumps(payload.get("storeId", "store-1"), ensure_ascii=False)}] || {json_script(payload)};
     function cssToken(name) {{
       return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
     }}
@@ -1786,18 +2088,25 @@ def build_html(payload: dict) -> str:
     function fmtNum(v) {{
       return Number(v).toLocaleString("zh-CN");
     }}
+    function contentTitle(row) {{
+      return window.getDashboardContentTitle ? window.getDashboardContentTitle(row) : (row["笔记标题"] || "");
+    }}
+    function contentAgeTooltip(row) {{
+      const age = window.getDashboardMaterialAgeInfo ? window.getDashboardMaterialAgeInfo(row) : {{ label: "" }};
+      return "<br/>素材发布时间: " + (age.date || "日期未知") + "<br/>素材年龄: " + (age.label || "日期未知");
+    }}
     const chartFactories = {{
       // GPM leaderboard - horizontal bar
       gpmLeaderboard: function(type, filteredRows) {{
-        const rows = filteredRows("gpmLeaderboard");
+        const rows = filteredRows("gpmLeaderboard").filter(r => r["样本状态"] === "可比较");
         const top10 = rows.slice(0, 10);
-        const names = top10.map(r => (r["笔记标题"] || "").slice(0, 18));
+        const names = top10.map(r => contentTitle(r).slice(0, 18));
         if (type === "scatter") {{
           return {{
             ...chartBase("primary", "secondary"),
             tooltip: {{ trigger: "item", formatter: function(params) {{
               const row = top10[params.dataIndex];
-              return row["笔记标题"] + "<br/>GPM: " + row["GPM"] + "<br/>支付金额: " + fmtMoney(row["支付金额"]) + "<br/>曝光量: " + fmtNum(row["曝光量"]);
+              return contentTitle(row) + contentAgeTooltip(row) + "<br/>GPM: " + row["GPM"] + "<br/>支付金额: " + fmtMoney(row["支付金额"]) + "<br/>曝光量: " + fmtNum(row["曝光量"]);
             }} }},
             grid: {{ left: 60, right: 24, top: 28, bottom: 36 }},
             xAxis: axisStyle({{ type: "value", name: "GPM", nameLocation: "middle", nameGap: 28 }}),
@@ -1808,7 +2117,7 @@ def build_html(payload: dict) -> str:
         return {{
           ...chartBase("primary"),
           tooltip: {{ trigger: "axis", axisPointer: {{ type: "shadow" }} }},
-          grid: {{ left: 54, right: 60, top: 20, bottom: 8 }},
+          grid: {{ left: 156, right: 60, top: 20, bottom: 8, containLabel: true }},
           xAxis: axisStyle({{ type: "value", axisLabel: {{ formatter: function(v) {{ return v.toFixed(0) }} }} }}),
           yAxis: axisStyle({{ type: "category", data: names.reverse(), axisLabel: {{ overflow: "truncate", width: 90 }} }}),
           series: [{{
@@ -1827,7 +2136,7 @@ def build_html(payload: dict) -> str:
           ...chartBase("primary"),
           tooltip: {{ trigger: "item", formatter: function(params) {{
             const row = rows[params.dataIndex];
-            return (row["笔记标题"] || "").slice(0, 20) + "<br/>GPM: " + row["GPM"].toFixed(2) + "<br/>曝光量: " + fmtNum(row["曝光量"]) + "<br/>支付金额: " + fmtMoney(row["支付金额"]);
+            return contentTitle(row).slice(0, 24) + contentAgeTooltip(row) + "<br/>GPM: " + row["GPM"].toFixed(2) + "<br/>曝光量: " + fmtNum(row["曝光量"]) + "<br/>支付金额: " + fmtMoney(row["支付金额"]);
           }} }},
           grid: {{ left: 52, right: 18, top: 28, bottom: 36 }},
           xAxis: axisStyle({{ type: "value", name: "曝光量", nameLocation: "middle", nameGap: 28, axisLabel: {{ formatter: function(v) {{ return fmtNum(v) }} }} }}),
@@ -1876,21 +2185,20 @@ def build_html(payload: dict) -> str:
         // 计算全局最大支付金额用于气泡大小归一化
         const allPays = rows.map(r => r["支付金额"] || 0);
         const maxPay = Math.max(...allPays) || 1;
-        const minBubble = 6;
-        const maxBubble = 36;
+        const minBubble = 4;
+        const maxBubble = 16;
+        const bubbleSize = (pay) => {{
+          const logPay = Math.log10(Math.max(0, pay || 0) + 10);
+          const logMax = Math.log10(maxPay + 10);
+          const ratio = logMax > 0 ? logPay / logMax : 0;
+          return Math.min(maxBubble, Math.max(minBubble, minBubble + ratio * (maxBubble - minBubble)));
+        }};
         
         const series = Object.entries(quadrants).map(([key, data]) => ({{
           name: qLabels[key],
           type: "scatter",
-          symbolSize: function(val) {{
-            const pay = val[2] && val[2]["支付金额"] ? val[2]["支付金额"] : 0;
-            // 对数缩放 + 线性映射，避免头部值过大
-            const logPay = Math.log10(pay + 10);
-            const logMax = Math.log10(maxPay + 10);
-            const ratio = logPay / logMax;
-            return minBubble + ratio * (maxBubble - minBubble);
-          }},
-          data: data.map(r => [r["曝光量"], r["GPM"], r]),
+          symbolSize: function(val) {{ return val[2] || minBubble; }},
+          data: data.map(r => [r["曝光量"], r["GPM"], bubbleSize(r["支付金额"]), r]),
           itemStyle: {{ color: qColors[key], opacity: 0.75 }},
           emphasis: {{ itemStyle: {{ opacity: 1, shadowBlur: 10 }} }},
         }}));
@@ -1904,8 +2212,8 @@ def build_html(payload: dict) -> str:
           tooltip: {{
             trigger: "item",
             formatter: function(params) {{
-              const row = params.data[2];
-              return (row["笔记标题"] || "").slice(0, 24) +
+              const row = params.data[3];
+              return contentTitle(row).slice(0, 24) + contentAgeTooltip(row) +
                 "<br/>笔记ID: " + (row["笔记ID"] || "") +
                 "<br/>账号: " + (row["账号"] || "") +
                 "<br/>曝光量: " + fmtNum(row["曝光量"]) +
@@ -1921,9 +2229,11 @@ def build_html(payload: dict) -> str:
             itemWidth: 10,
             itemHeight: 10,
           }},
-          grid: {{ left: 60, right: 24, top: 28, bottom: 56 }},
+          grid: {{ left: 92, right: 30, top: 28, bottom: 56, containLabel: true }},
           xAxis: axisStyle({{
-            type: "value",
+             type: "log",
+             logBase: 10,
+             min: 1,
             name: "曝光量",
             nameLocation: "middle",
             nameGap: 28,
@@ -2013,19 +2323,18 @@ def build_html(payload: dict) -> str:
         // 计算全局最大支付金额用于气泡大小归一化
         const allPays2 = dataWithMetrics.map(r => r["支付金额"] || 0);
         const maxPay2 = Math.max(...allPays2) || 1;
+        const bubbleSize2 = (pay) => {{
+          const logPay = Math.log10(Math.max(0, pay || 0) + 10);
+          const logMax = Math.log10(maxPay2 + 10);
+          const ratio = logMax > 0 ? logPay / logMax : 0;
+          return Math.min(16, Math.max(4, 4 + ratio * 12));
+        }};
         
         const series = Object.entries(quadrants).map(([key, data]) => ({{
           name: qLabels[key],
           type: "scatter",
-          symbolSize: function(val) {{
-            const pay = val[2] && val[2]["支付金额"] ? val[2]["支付金额"] : 0;
-            // 对数缩放 + 线性映射，避免头部值过大
-            const logPay = Math.log10(pay + 10);
-            const logMax = Math.log10(maxPay2 + 10);
-            const ratio = logPay / logMax;
-            return 6 + ratio * 30;
-          }},
-          data: data.map(r => [r.CTR * 100, r.CVR * 100, r]),
+          symbolSize: function(val) {{ return val[2] || 4; }},
+          data: data.map(r => [r.CTR * 100, r.CVR * 100, bubbleSize2(r["支付金额"]), r]),
           itemStyle: {{ color: qColors[key], opacity: 0.75 }},
           emphasis: {{ itemStyle: {{ opacity: 1, shadowBlur: 10 }} }},
         }}));
@@ -2039,8 +2348,8 @@ def build_html(payload: dict) -> str:
           tooltip: {{
             trigger: "item",
             formatter: function(params) {{
-              const row = params.data[2];
-              return (row["笔记标题"] || "").slice(0, 24) +
+              const row = params.data[3];
+              return contentTitle(row).slice(0, 24) + contentAgeTooltip(row) +
                 "<br/>笔记ID: " + (row["笔记ID"] || "") +
                 "<br/>账号: " + (row["账号"] || "") +
                 "<br/>CTR: " + row.CTR.toFixed(2) + "%" +
@@ -2057,7 +2366,7 @@ def build_html(payload: dict) -> str:
             itemWidth: 10,
             itemHeight: 10,
           }},
-          grid: {{ left: 60, right: 24, top: 28, bottom: 56 }},
+          grid: {{ left: 92, right: 30, top: 28, bottom: 56, containLabel: true }},
           xAxis: axisStyle({{
             type: "value",
             name: "CTR(点击率 %)",
@@ -2131,7 +2440,7 @@ def build_html(payload: dict) -> str:
             }}
           }},
           legend: {{ data: ["总支付金额", "平均GPM"], textStyle: {{ color: cssToken("--chart-text") }} }},
-          grid: {{ left: 74, right: 18, top: 36, bottom: 24 }},
+           grid: {{ left: 148, right: 18, top: 36, bottom: 24, containLabel: true }},
           xAxis: axisStyle({{ type: "value" }}),
           yAxis: axisStyle({{ type: "category", data: names.reverse(), axisLabel: {{ overflow: "truncate", width: 100 }} }}),
           series: [
@@ -2258,7 +2567,7 @@ def build_html(payload: dict) -> str:
             trigger: "item",
             formatter: function(params) {{
               const row = params.data[2];
-              return (row["笔记标题"] || "").slice(0, 24) +
+              return contentTitle(row).slice(0, 24) + contentAgeTooltip(row) +
                 "<br/>笔记ID: " + (row["笔记ID"] || "") +
                 "<br/>CTR: " + Number(row.CTR || 0).toFixed(2) + "%" +
                 "<br/>商品点击率: " + Number(row["商品点击率"] || 0).toFixed(2) + "%" +
@@ -2301,6 +2610,22 @@ def build_html(payload: dict) -> str:
           }}
         }};
       }},
+      // Content type comparison
+      contentTypeComparison: function(type, filteredRows, aggregate) {{
+        const rows = aggregate().typeSummary || [];
+        return {{
+          ...chartBase("primary", "secondary"),
+          tooltip: {{ trigger: "axis", axisPointer: {{ type: "shadow" }} }},
+          legend: {{ data: ["总支付金额", "平均GPM"], textStyle: {{ color: cssToken("--chart-text") }} }},
+          grid: {{ left: 54, right: 18, top: 36, bottom: 36 }},
+          xAxis: axisStyle({{ type: "category", data: rows.map(r => r["笔记类型"]) }}),
+          yAxis: axisStyle({{ type: "value", axisLabel: {{ formatter: function(v) {{ return fmtNum(v) }} }} }}),
+          series: [
+            {{ type: "bar", name: "总支付金额", data: rows.map(r => r["总支付金额"]), barMaxWidth: 28 }},
+            {{ type: "bar", name: "平均GPM", data: rows.map(r => r["平均GPM"]), barMaxWidth: 28 }}
+          ]
+        }};
+      }},
       // Account comparison
       accountComparison: function(type, filteredRows, aggregate) {{
         const rows = aggregate().accountSummary;
@@ -2320,7 +2645,7 @@ def build_html(payload: dict) -> str:
           color: rows.map((r, i) => categoricalColor(r["账号"], i)),
           tooltip: {{ trigger: "axis", axisPointer: {{ type: "shadow" }} }},
           legend: {{ data: ["总支付金额", "平均GPM"], textStyle: {{ color: cssToken("--chart-text") }} }},
-          grid: {{ left: 74, right: 18, top: 36, bottom: 24 }},
+           grid: {{ left: 148, right: 18, top: 36, bottom: 24, containLabel: true }},
           xAxis: axisStyle({{ type: "value", axisLabel: {{ formatter: function(v) {{ return fmtMoney(v) }} }} }}),
           yAxis: axisStyle({{ type: "category", data: names }}),
           series: [
@@ -2587,7 +2912,7 @@ def build_html(payload: dict) -> str:
               return "账号: " + acc + "<br/>商品: " + prod + "<br/>平均GPM: " + params.data[2].toFixed(2);
             }}
           }},
-          grid: {{ left: 80, right: 24, top: 24, bottom: 72 }},
+           grid: {{ left: 132, right: 24, top: 24, bottom: 72, containLabel: true }},
           xAxis: axisStyle({{
             type: "category",
             data: shortProducts,
@@ -2766,6 +3091,7 @@ def build_html(payload: dict) -> str:
     }};
     const sourceMap = {json_script(source_map)};
     const productFilter = {json_script(payload.get("productFilter") or {})};
+    const accountFilter = {json_script(payload.get("accountFilter") or {})};
     const kpiConfig = {{
       totalNotes: {{
         label: "笔记总数",
@@ -2861,6 +3187,7 @@ def build_html(payload: dict) -> str:
       }},
     }};
     setupDashboardRuntime({{
+      storePayloads: storePayloads,
       datasets: dashboardPayload.datasets,
       availableDates: dashboardPayload.availableDates,
       defaultRange: dashboardPayload.defaultRange,
@@ -2869,10 +3196,29 @@ def build_html(payload: dict) -> str:
       sourceMap,
       tables: {json_script(table_config)},
       productFilter,
+      accountFilter,
       kpiConfig,
       fullScript: {js_string(ANALYSIS_LOGIC)},
       modalSubtitlePrefix: "Dashboard panel transform for "
     }});
+    function setupSectionTabs() {{
+      const tabs = Array.from(document.querySelectorAll("[data-section-tab]"));
+      const panels = Array.from(document.querySelectorAll("[data-section-panel]"));
+      const charts = {json_script(initial_charts)};
+      function activate(section) {{
+        tabs.forEach(tab => tab.classList.toggle("is-active", tab.dataset.sectionTab === section));
+        panels.forEach(panel => panel.classList.toggle("is-active", panel.dataset.sectionPanel === section));
+        window.requestAnimationFrame(() => {{
+          charts.forEach(item => {{
+            const chart = window.echarts && echarts.getInstanceByDom(document.getElementById(item.id));
+            if (chart) chart.resize();
+          }});
+        }});
+      }}
+      tabs.forEach(tab => tab.addEventListener("click", () => activate(tab.dataset.sectionTab)));
+      activate("content");
+    }}
+    setupSectionTabs();
     """
 
     return f"""<!-- Generated by Trae Work -->
@@ -2893,6 +3239,12 @@ def build_html(payload: dict) -> str:
         <p class="freshness" id="dataFreshness">最新数据: {html.escape(payload["freshness"]["latestDataDate"])} | 来源: {html.escape(payload["freshness"]["source"])} | {html.escape(payload["timezone"])}</p>
       </div>
       <div class="controls" aria-label="Dashboard time controls">
+        <div class="product-select-wrap" aria-label="店铺筛选">
+          <label class="product-select-label" for="storeSelect">店铺</label>
+          <select id="storeSelect" class="product-select">
+            {store_options_html}
+          </select>
+        </div>
         <span class="range-label" id="activeRangeLabel"></span>
         <div class="segmented" aria-label="Time preset">
           <button data-range-preset="7D">7D</button>
@@ -2910,6 +3262,18 @@ def build_html(payload: dict) -> str:
           <label class="product-select-label" for="productSelect">商品筛选</label>
           <select id="productSelect" class="product-select">
             {product_options_html}
+          </select>
+        </div>
+        <div class="product-select-wrap" aria-label="账号筛选">
+          <label class="product-select-label" for="accountSelect">账号筛选</label>
+          <select id="accountSelect" class="product-select">
+            {account_options_html}
+          </select>
+        </div>
+        <div class="product-select-wrap" aria-label="笔记类型筛选">
+          <label class="product-select-label" for="noteTypeSelect">类型筛选</label>
+          <select id="noteTypeSelect" class="product-select">
+            {note_type_options_html}
           </select>
         </div>
         <div class="segmented theme-switch" aria-label="Theme">
@@ -2989,13 +3353,24 @@ def build_html(payload: dict) -> str:
 
 
 def main() -> None:
-    rows = normalize_snapshots(read_sources())
-    if not rows:
-        print("ERROR: No data found in data/notes_gpm.csv")
+    store_payloads = {}
+    legacy_source = ROOT / "data" / "notes_gpm.csv"
+    for store in STORE_CONFIG:
+        source_path = store["path"]
+        if store["id"] == "store-1" and not source_path.exists() and legacy_source.exists():
+            source_path = legacy_source
+        rows = normalize_snapshots(read_sources(source_path))
+        store_payloads[store["id"]] = make_dashboard_payload(rows, store["id"], store["name"])
+
+    primary_payload = store_payloads[STORE_CONFIG[0]["id"]]
+    if not any(payload["datasets"]["allRows"] for payload in store_payloads.values()):
+        print("ERROR: No store data found")
         return
-    payload = make_dashboard_payload(rows)
-    DASHBOARD_DATA.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
-    DASHBOARD_HTML.write_text(build_html(payload), encoding="utf-8")
+    export_payload = dict(primary_payload)
+    export_payload["defaultStore"] = STORE_CONFIG[0]["id"]
+    export_payload["stores"] = store_payloads
+    DASHBOARD_DATA.write_text(json.dumps(export_payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    DASHBOARD_HTML.write_text(build_html(primary_payload, store_payloads), encoding="utf-8")
     print(f"Wrote {DASHBOARD_HTML}")
     print(f"Wrote {DASHBOARD_DATA}")
 

@@ -5,6 +5,63 @@
     return Number.isNaN(date.getTime()) ? null : date;
   }
 
+  function localToday() {
+    const now = new Date();
+    return new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  }
+
+  function materialAgeInfo(row) {
+    const raw = row["素材发布时间"] || row["发布时间"] || row["日期"] || row.date || "";
+    const published = parseDate(String(raw).slice(0, 10));
+    if (!published) {
+      return { date: raw || "", days: null, marker: "", status: "日期未知", label: "日期未知" };
+    }
+    const today = localToday();
+    const days = Math.floor((today - published) / (1000 * 60 * 60 * 24));
+    if (days < 0) {
+      return { date: String(raw).slice(0, 10), days, marker: "", status: "日期异常", label: "日期异常" };
+    }
+    const old = days > 180;
+    return {
+      date: String(raw).slice(0, 10),
+      days,
+      marker: old ? "⚠️" : "",
+      status: old ? "超过180天" : "180天内",
+      label: old ? `⚠️ ${days}天 · 超过180天` : `${days}天`,
+    };
+  }
+
+  function contentDisplayRow(row) {
+    const age = materialAgeInfo(row);
+    const title = String(row["笔记标题"] || "");
+    return {
+      ...row,
+      "笔记标题": age.marker && !title.startsWith(age.marker) ? `${age.marker} ${title}` : title,
+      "素材发布时间": age.date,
+      "素材年龄": age.label,
+      "素材年龄天数": age.days,
+      "素材年龄标记": age.marker,
+    };
+  }
+
+  function isOfficialSupportCandidate(row) {
+    const raw = row["素材发布时间"] || row["发布时间"] || row["日期"] || row.date || "";
+    const published = parseDate(String(raw).slice(0, 10));
+    if (!published || (row["阅读量"] || 0) <= 200) return false;
+    const today = localToday();
+    const start = new Date(today);
+    start.setDate(start.getDate() - 14);
+    return published >= start && published <= today;
+  }
+
+  window.getDashboardMaterialAgeInfo = materialAgeInfo;
+  window.getDashboardContentTitle = function getDashboardContentTitle(row) {
+    const age = materialAgeInfo(row);
+    const title = String(row["笔记标题"] || "");
+    return age.marker && !title.startsWith(age.marker) ? `${age.marker} ${title}` : title;
+  };
+  window.isDashboardOfficialSupportCandidate = isOfficialSupportCandidate;
+
   function isoDate(date) {
     const year = date.getFullYear();
     const month = String(date.getMonth() + 1).padStart(2, "0");
@@ -48,19 +105,103 @@
     const chartFactories = config.chartFactories || {};
     const sourceMap = config.sourceMap || {};
     const tables = config.tables || {};
-    const allDates = (config.availableDates || []).slice().sort();
-    const productFilter = config.productFilter || {};
-    const productField = productFilter.field || null;
-    const productOptions = productFilter.options || [];
-    const productCombine = productFilter.combine || {};
-    const defaultProduct = productFilter.default || "全部";
+    const storePayloads = config.storePayloads || {};
+    const storeIds = Object.keys(storePayloads);
+    const storeStorageKey = "xhs-dashboard-store";
+    const initialStoreId = (() => {
+      try {
+        const saved = window.localStorage.getItem(storeStorageKey);
+        return storePayloads[saved] ? saved : (storeIds[0] || "");
+      } catch (error) {
+        return storeIds[0] || "";
+      }
+    })();
+    let activeStoreId = initialStoreId;
+    let activeConfig = storePayloads[activeStoreId] || config;
+    let allDates = (activeConfig.availableDates || []).slice().sort();
+    let productFilter = activeConfig.productFilter || {};
+    let productField = productFilter.field || null;
+    let productOptions = productFilter.options || [];
+    let productCombine = productFilter.combine || {};
+    let defaultProduct = productFilter.default || "全部";
+    let accountFilter = activeConfig.accountFilter || {};
+    let accountOptions = accountFilter.options || [];
+    let defaultAccount = accountFilter.default || "全部";
+    let noteTypeFilter = activeConfig.noteTypeFilter || {};
+    let noteTypeOptions = noteTypeFilter.options || [];
+    let defaultNoteType = noteTypeFilter.default || "全部";
     const kpiConfig = config.kpiConfig || {};
     const chartState = {};
     const state = {
-      preset: config.defaultRange || "30D",
+      preset: activeConfig.defaultRange || config.defaultRange || "30D",
       product: defaultProduct,
-      ...computeRange(config.defaultRange || "30D", allDates),
+      account: defaultAccount,
+      noteType: defaultNoteType,
+      ...computeRange(activeConfig.defaultRange || config.defaultRange || "30D", allDates),
     };
+
+    function persistStoreId() {
+      try {
+        window.localStorage.setItem(storeStorageKey, activeStoreId);
+      } catch (error) {
+        // Private browsing or blocked storage must not break store switching.
+      }
+    }
+
+    function updateStoreControls() {
+      const select = document.getElementById("storeSelect");
+      if (select) select.value = activeStoreId;
+      const title = document.querySelector(".topbar h1");
+      if (title && activeConfig.storeName) title.textContent = `${activeConfig.title || "小红书笔记转化分析看板"} · ${activeConfig.storeName}`;
+      const freshness = document.getElementById("dataFreshness");
+      if (freshness) freshness.textContent = `店铺：${activeConfig.storeName || activeStoreId} · 最新数据: ${(activeConfig.freshness || {}).latestDataDate || "暂无"} | 来源: ${(activeConfig.freshness || {}).source || "暂无数据"} | ${activeConfig.timezone || "Asia/Shanghai"}`;
+    }
+
+    function updateFilterOptions() {
+      const productSelect = document.getElementById("productSelect");
+      if (productSelect) {
+        productSelect.replaceChildren(new Option("全部商品", "全部"));
+        (productFilter.productList || []).forEach((item) => productSelect.appendChild(new Option(`${item.short_name} (${item.count}条)`, item.id)));
+        productSelect.value = state.product;
+      }
+      const accountSelect = document.getElementById("accountSelect");
+      if (accountSelect) {
+        accountSelect.replaceChildren(...accountOptions.map((value) => new Option(value === "全部" ? "全部账号" : value, value)));
+        accountSelect.value = state.account;
+      }
+      const noteTypeSelect = document.getElementById("noteTypeSelect");
+      if (noteTypeSelect) {
+        noteTypeSelect.replaceChildren(...noteTypeOptions.map((value) => new Option(value === "全部" ? "全部类型" : value, value)));
+        noteTypeSelect.value = state.noteType;
+      }
+    }
+
+    function switchStore(storeId) {
+      if (!storePayloads[storeId] || storeId === activeStoreId) return;
+      activeStoreId = storeId;
+      activeConfig = storePayloads[activeStoreId];
+      allDates = (activeConfig.availableDates || []).slice().sort();
+      productFilter = activeConfig.productFilter || {};
+      productField = productFilter.field || null;
+      productOptions = productFilter.options || [];
+      productCombine = productFilter.combine || {};
+      defaultProduct = productFilter.default || "全部";
+      accountFilter = activeConfig.accountFilter || {};
+      accountOptions = accountFilter.options || [];
+      defaultAccount = accountFilter.default || "全部";
+      noteTypeFilter = activeConfig.noteTypeFilter || {};
+      noteTypeOptions = noteTypeFilter.options || [];
+      defaultNoteType = noteTypeFilter.default || "全部";
+      state.preset = activeConfig.defaultRange || "30D";
+      state.product = defaultProduct;
+      state.account = defaultAccount;
+      state.noteType = defaultNoteType;
+      Object.assign(state, computeRange(state.preset, allDates));
+      persistStoreId();
+      updateStoreControls();
+      updateFilterOptions();
+      refresh();
+    }
 
     function matchesProduct(row) {
       if (!productField || state.product === "全部") return true;
@@ -71,9 +212,17 @@
       return value === state.product;
     }
 
+    function matchesAccount(row) {
+      return state.account === "全部" || String(row["账号"] || "") === state.account;
+    }
+
+    function matchesNoteType(row) {
+      return state.noteType === "全部" || String(row["笔记类型"] || "") === state.noteType;
+    }
+
     function filteredRows(key) {
-      const rows = (config.datasets && config.datasets[key]) || [];
-      return rows.filter((row) => withinRange(row, state) && matchesProduct(row));
+      const rows = (activeConfig.datasets && activeConfig.datasets[key]) || [];
+      return rows.filter((row) => withinRange(row, state) && matchesProduct(row) && matchesAccount(row) && matchesNoteType(row));
     }
 
     function aggregate() {
@@ -244,8 +393,9 @@
       ];
 
       // ===== 零成交笔记分析 =====
-      const zeroPay = all.filter(r => (r["支付金额"] || 0) === 0);
-      // 按CTR和商品点击率分四象限
+      // 只诊断有商品点击但尚未成交的笔记；商品点击为0的笔记无法判断商品承接效果。
+      const zeroPay = all.filter(r => (r["支付金额"] || 0) === 0 && (r["商品点击次数"] || 0) > 0);
+      // 按CTR和商品点击率分四象限，样本已保证商品点击次数大于0
       const zeroWithData = zeroPay.filter(r => r["曝光量"] > 0);
       const ctrs = zeroWithData.map(r => (r["阅读量"] || 0) / r["曝光量"]).sort((a, b) => a - b);
       const clickRates = zeroWithData.map(r => (r["商品点击次数"] || 0) / Math.max(r["阅读量"] || 1, 1)).sort((a, b) => a - b);
@@ -449,7 +599,9 @@
       if (!label) return;
       const productNames = productFilter.productNames || {};
       const scope = state.product === "全部" ? "全部商品" : productNames[state.product] || state.product;
-      label.textContent = state.start && state.end ? `${scope} · ${state.start} to ${state.end}` : `${scope} · No dated rows`;
+      const accountScope = state.account === "全部" ? "全部账号" : state.account;
+      const noteTypeScope = state.noteType === "全部" ? "全部类型" : state.noteType;
+      label.textContent = state.start && state.end ? `${accountScope} · ${scope} · ${noteTypeScope} · ${state.start} to ${state.end}` : `${accountScope} · ${scope} · ${noteTypeScope} · No dated rows`;
     }
 
     function setDateInputs() {
@@ -487,17 +639,40 @@
       });
     }
 
+    function chartOptionWithEmptyState(option) {
+      const series = Array.isArray(option?.series) ? option.series : [];
+      const hasData = series.some((item) => {
+        if (!item || !Array.isArray(item.data)) return false;
+        return item.data.length > 0;
+      });
+      if (hasData || option?.graphic) return option;
+      return {
+        ...option,
+        graphic: [{
+          type: "text",
+          left: "center",
+          top: "middle",
+          style: {
+            text: "暂无可用数据",
+            fill: cssToken("--chart-muted") || "#68707a",
+            fontSize: 14,
+            fontWeight: 400,
+          },
+        }],
+      };
+    }
+
     function initChart(id, type) {
       const el = document.getElementById(id);
       if (!el || !chartFactories[id]) return;
       const chart = echarts.init(el, null, { renderer: "canvas" });
       chartState[id] = { chart, type };
-      chart.setOption(chartFactories[id](type, filteredRows, aggregate), true);
+      chart.setOption(chartOptionWithEmptyState(chartFactories[id](type, filteredRows, aggregate)), true);
     }
 
     function updateCharts() {
       Object.entries(chartState).forEach(([id, entry]) => {
-        if (chartFactories[id]) entry.chart.setOption(chartFactories[id](entry.type, filteredRows, aggregate), true);
+        if (chartFactories[id]) entry.chart.setOption(chartOptionWithEmptyState(chartFactories[id](entry.type, filteredRows, aggregate)), true);
       });
     }
 
@@ -508,10 +683,15 @@
 
         // 商品效率榜单使用 aggregate 数据（支持筛选联动）
         let rows;
-        if (tableConfig.useAggregate === "productSummary") {
+        if (tableConfig.derived === "officialSupportCandidates") {
+          rows = filteredRows("allRows").filter(isOfficialSupportCandidate);
+        } else if (tableConfig.useAggregate === "productSummary") {
           rows = (aggregate().productSummary || []).slice();
         } else {
           rows = filteredRows(tableConfig.dataset).slice();
+        }
+        if (tableConfig.contentAge) {
+          rows = rows.map(contentDisplayRow);
         }
 
         // 四象限榜单特殊处理：计算象限并按优先级排序
@@ -540,6 +720,18 @@
             const pa = a["支付金额"] || 0;
             const pb = b["支付金额"] || 0;
             return pb - pa;
+          });
+        } else if (tableConfig.sortFields) {
+          rows.sort((a, b) => {
+            for (const sort of tableConfig.sortFields) {
+              const left = a[sort.field];
+              const right = b[sort.field];
+              const direction = sort.direction === "asc" ? 1 : -1;
+              if (left === right) continue;
+              if (typeof left === "number" && typeof right === "number") return (left - right) * direction;
+              return String(left || "").localeCompare(String(right || "")) * direction;
+            }
+            return 0;
           });
         } else if (tableConfig.sortField) {
           rows.sort((a, b) => {
@@ -601,6 +793,24 @@
       state.product = value;
       refresh();
     };
+
+    window.setAccountFilter = function setAccountFilter(value) {
+      if (accountOptions.length && !accountOptions.includes(value)) return;
+      state.account = value;
+      const select = document.getElementById("accountSelect");
+      if (select) select.value = state.account;
+      refresh();
+    };
+
+    window.setNoteTypeFilter = function setNoteTypeFilter(value) {
+      if (noteTypeOptions.length && !noteTypeOptions.includes(value)) return;
+      state.noteType = value;
+      const select = document.getElementById("noteTypeSelect");
+      if (select) select.value = state.noteType;
+      refresh();
+    };
+
+    window.setDashboardStore = switchStore;
 
     window.setChartType = function setChartType(id, type) {
       if (!chartState[id] || !chartFactories[id]) return;
@@ -664,6 +874,53 @@
       }, 1200);
     };
 
+    // Theme switching: keep the theme local to this browser and refresh charts
+    // so ECharts picks up the CSS variable palette after the DOM theme changes.
+    const themeStorageKey = "xhs-dashboard-theme";
+    const themeButtons = Array.from(document.querySelectorAll("[data-theme-choice]"));
+    function readSavedTheme() {
+      try {
+        const saved = window.localStorage.getItem(themeStorageKey);
+        return saved === "trae-dark" ? "trae-dark" : "light";
+      } catch (error) {
+        return "light";
+      }
+    }
+
+    function applyTheme(theme, persist = true) {
+      const nextTheme = theme === "trae-dark" ? "trae-dark" : "light";
+      if (nextTheme === "trae-dark") {
+        document.documentElement.setAttribute("data-theme", "trae-dark");
+      } else {
+        document.documentElement.removeAttribute("data-theme");
+      }
+      themeButtons.forEach((button) => {
+        button.classList.toggle("active", button.dataset.themeChoice === nextTheme);
+      });
+      if (persist) {
+        try {
+          window.localStorage.setItem(themeStorageKey, nextTheme);
+        } catch (error) {
+          // Private browsing or blocked storage must not break theme switching.
+        }
+      }
+      updateCharts();
+      Object.values(chartState).forEach((entry) => entry.chart.resize());
+    }
+
+    window.setDashboardTheme = applyTheme;
+    themeButtons.forEach((button) => {
+      button.addEventListener("click", () => applyTheme(button.dataset.themeChoice));
+    });
+    applyTheme(readSavedTheme(), false);
+
+    updateStoreControls();
+    updateFilterOptions();
+    const storeSelect = document.getElementById("storeSelect");
+    if (storeSelect) {
+      storeSelect.addEventListener("change", (event) => switchStore(event.target.value));
+    }
+
     (config.initialCharts || []).forEach((item) => initChart(item.id, item.type));
     refresh();
 
@@ -676,6 +933,14 @@
     const productSelect = document.getElementById("productSelect");
     if (productSelect) {
       productSelect.addEventListener("change", (e) => window.setProductFilter(e.target.value));
+    }
+    const accountSelect = document.getElementById("accountSelect");
+    if (accountSelect) {
+      accountSelect.addEventListener("change", (e) => window.setAccountFilter(e.target.value));
+    }
+    const noteTypeSelect = document.getElementById("noteTypeSelect");
+    if (noteTypeSelect) {
+      noteTypeSelect.addEventListener("change", (e) => window.setNoteTypeFilter(e.target.value));
     }
     document.addEventListener("click", (event) => {
       if (!event.target.closest(".toolbox")) {
