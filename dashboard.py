@@ -25,9 +25,9 @@ DEFAULT_RANGE = "30D"
 UNLINKED_PRODUCT_ID = "__UNLINKED__"
 
 STORE_CONFIG = [
-    {"id": "store-1", "name": "鲜水湾", "path": ROOT / "data" / "stores" / "store-1" / "notes_gpm.csv", "product_path": ROOT / "data" / "stores" / "store-1" / "product_notes_archive"},
-    {"id": "store-2", "name": "琪琪生鲜", "path": ROOT / "data" / "stores" / "store-2" / "notes_gpm.csv", "product_path": ROOT / "data" / "stores" / "store-2" / "product_notes_archive"},
-    {"id": "store-3", "name": "玺牛生鲜", "path": ROOT / "data" / "stores" / "store-3" / "notes_gpm.csv", "product_path": ROOT / "data" / "stores" / "store-3" / "product_notes_archive"},
+    {"id": "store-1", "name": "鲜水湾", "path": ROOT / "data" / "stores" / "store-1" / "notes_gpm.csv", "product_path": ROOT / "data" / "stores" / "store-1" / "product_notes_archive", "note_analysis_path": ROOT / "data" / "stores" / "store-1" / "note_analysis_archive"},
+    {"id": "store-2", "name": "琪琪生鲜", "path": ROOT / "data" / "stores" / "store-2" / "notes_gpm.csv", "product_path": ROOT / "data" / "stores" / "store-2" / "product_notes_archive", "note_analysis_path": ROOT / "data" / "stores" / "store-2" / "note_analysis_archive"},
+    {"id": "store-3", "name": "玺牛生鲜", "path": ROOT / "data" / "stores" / "store-3" / "notes_gpm.csv", "product_path": ROOT / "data" / "stores" / "store-3" / "product_notes_archive", "note_analysis_path": ROOT / "data" / "stores" / "store-3" / "note_analysis_archive"},
 ]
 
 
@@ -43,8 +43,8 @@ def pct(value: float) -> str:
     return f"{value * 100:+.1f}%"
 
 
-def read_sources(csv_path: Path | None = None) -> list[dict]:
-    """Read one store's GPM CSV data."""
+def read_sources(csv_path: Path | None = None, note_analysis_dir: Path | None = None) -> list[dict]:
+    """Read one store's GPM data and enrich it with the latest note analysis export."""
     csv_path = csv_path or ROOT / "data" / "notes_gpm.csv"
     if not csv_path.exists():
         return []
@@ -56,6 +56,66 @@ def read_sources(csv_path: Path | None = None) -> list[dict]:
             raw_dt = str(row.get("发布时间") or "")[:10]
             row["date"] = raw_dt
             rows.append(row)
+
+    if note_analysis_dir:
+        analysis_files = sorted(note_analysis_dir.glob("????-??-??.xlsx"), reverse=True)
+        if analysis_files:
+            try:
+                import pandas as pd
+                analysis = pd.read_excel(analysis_files[0])
+                required = {"笔记ID", "笔记信息", "笔记发布时间", "所属创作者", "笔记类型", "推广状态", "全部曝光量", "全部阅读量", "全部互动量"}
+                if required.issubset(analysis.columns):
+                    analysis_rows = {}
+                    for _, item in analysis.iterrows():
+                        note_id = str(item.get("笔记ID") or "").strip()
+                        if note_id and note_id.lower() != "nan":
+                            analysis_rows[note_id] = item
+
+                    current_ids = set()
+                    for row in rows:
+                        note_id = str(row.get("笔记ID") or "").strip()
+                        current_ids.add(note_id)
+                        item = analysis_rows.get(note_id)
+                        if item is None:
+                            continue
+                        row["笔记标题"] = str(item.get("笔记信息") or row.get("笔记标题") or "")
+                        row["发布时间"] = str(item.get("笔记发布时间") or row.get("发布时间") or "")
+                        row["date"] = row["发布时间"][:10]
+                        row["账号"] = str(item.get("所属创作者") or row.get("账号") or "")
+                        row["笔记类型"] = str(item.get("笔记类型") or row.get("笔记类型") or "")
+                        row["推广状态"] = str(item.get("推广状态") or row.get("推广状态") or "")
+                        row["曝光量"] = item.get("全部曝光量")
+                        row["阅读量"] = item.get("全部阅读量")
+                        row["互动量"] = item.get("全部互动量")
+
+                    for note_id, item in analysis_rows.items():
+                        if note_id in current_ids:
+                            continue
+                        rows.append({
+                            "笔记ID": note_id,
+                            "笔记标题": str(item.get("笔记信息") or ""),
+                            "账号": str(item.get("所属创作者") or ""),
+                            "发布时间": str(item.get("笔记发布时间") or ""),
+                            "笔记类型": str(item.get("笔记类型") or ""),
+                            "推广状态": str(item.get("推广状态") or ""),
+                            "曝光量": item.get("全部曝光量") or 0,
+                            "阅读量": item.get("全部阅读量") or 0,
+                            "互动量": item.get("全部互动量") or 0,
+                            "支付金额": 0,
+                            "支付订单数": 0,
+                            "支付人数": 0,
+                            "商品点击次数": item.get("商品访客量") or 0,
+                            "商品点击人数": item.get("商品访客量") or 0,
+                            "加购件数": item.get("商品加购量") or 0,
+                            "退款金额": 0,
+                            "退款订单数": 0,
+                            "GPM": 0,
+                            "GPM状态": "无成交数据",
+                            "date": str(item.get("笔记发布时间") or "")[:10],
+                        })
+            except Exception:
+                # A malformed or unavailable latest export must not hide the existing CSV data.
+                pass
     return rows
 
 
@@ -176,22 +236,34 @@ def normalize_snapshots(rows: list[dict], store_dir: Path | None = None, note_pr
     """Normalize and deduplicate rows by 笔记ID."""
     if note_product_map is None:
         note_product_map, _ = load_product_mapping(store_dir)
+
+    def number(value) -> float:
+        if value is None:
+            return 0.0
+        text = str(value).strip().replace(",", "").replace("%", "")
+        if not text or text.lower() in {"nan", "nat", "none"}:
+            return 0.0
+        try:
+            return float(text)
+        except (TypeError, ValueError):
+            return 0.0
+
     normalized = []
     for raw in rows:
         row = dict(raw)
         row["date"] = str(row.get("date") or "")[:10]
-        row["GPM"] = float(row.get("GPM") or 0)
-        row["支付金额"] = float(row.get("支付金额") or 0)
-        row["支付订单数"] = int(float(row.get("支付订单数") or 0))
-        row["支付人数"] = int(float(row.get("支付人数") or 0))
-        row["曝光量"] = int(float(row.get("曝光量") or 0))
-        row["阅读量"] = int(float(row.get("阅读量") or 0))
-        row["互动量"] = int(float(row.get("互动量") or 0))
-        row["商品点击次数"] = int(float(row.get("商品点击次数") or 0))
-        row["商品点击人数"] = int(float(row.get("商品点击人数") or 0))
-        row["加购件数"] = int(float(row.get("加购件数") or 0))
-        row["退款金额"] = float(row.get("退款金额") or 0)
-        row["退款订单数"] = int(float(row.get("退款订单数") or 0))
+        row["GPM"] = number(row.get("GPM"))
+        row["支付金额"] = number(row.get("支付金额"))
+        row["支付订单数"] = int(number(row.get("支付订单数")))
+        row["支付人数"] = int(number(row.get("支付人数")))
+        row["曝光量"] = int(number(row.get("曝光量")))
+        row["阅读量"] = int(number(row.get("阅读量")))
+        row["互动量"] = int(number(row.get("互动量")))
+        row["商品点击次数"] = int(number(row.get("商品点击次数")))
+        row["商品点击人数"] = int(number(row.get("商品点击人数")))
+        row["加购件数"] = int(number(row.get("加购件数")))
+        row["退款金额"] = number(row.get("退款金额"))
+        row["退款订单数"] = int(number(row.get("退款订单数")))
         row["GPM状态"] = str(row.get("GPM状态") or "无成交数据")
         note_id = str(row.get("笔记ID") or "")
         
@@ -3381,7 +3453,7 @@ def main() -> None:
         if store["id"] == "store-1" and not source_path.exists() and legacy_source.exists():
             source_path = legacy_source
         note_product_map, product_list = load_product_mapping(store["product_path"])
-        rows = normalize_snapshots(read_sources(source_path), store["product_path"], note_product_map)
+        rows = normalize_snapshots(read_sources(source_path, store["note_analysis_path"]), store["product_path"], note_product_map)
         store_payloads[store["id"]] = make_dashboard_payload(rows, store["id"], store["name"], product_list)
 
     primary_payload = store_payloads[STORE_CONFIG[0]["id"]]

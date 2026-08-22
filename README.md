@@ -29,6 +29,8 @@ python dashboard.py
 
 鲜水湾的商品笔记映射按月份封存在 `data/stores/store-1/product_notes_archive/`，文件名使用 `YYYY-MM.xlsx`。生成器会合并全部月份，并按最新月份记录优先匹配笔记ID和商品ID。后续只需新增或替换最新月份文件，再重新运行生成命令。
 
+鲜水湾最新笔记维度数据按日期封存在 `data/stores/store-1/note_analysis_archive/`。生成器会用最新文件更新曝光、阅读、互动、发布时间和账号等内容指标，同时保留现有支付和GPM数据。
+
 页面顶部可以切换店铺。切换后，KPI、图表、排行、表格以及日期、账号、商品和笔记类型筛选均只使用当前店铺数据。
 
 ## 当前功能
